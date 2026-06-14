@@ -1,0 +1,168 @@
+version: "3.9"
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# AI Recommendation Engine — Docker Compose
+# Services: backend · frontend · postgres · redis · qdrant · mlflow · prometheus · grafana
+# ═══════════════════════════════════════════════════════════════════════════════
+
+networks:
+  recnet:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  redis_data:
+  qdrant_data:
+  mlflow_data:
+  prometheus_data:
+  grafana_data:
+
+services:
+
+  # ── Backend (FastAPI) ──────────────────────────────────────────────────────
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: recengine-backend
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://recuser:recpass@postgres:5432/recengine
+      REDIS_URL: redis://redis:6379/0
+      QDRANT_URL: http://qdrant:6333
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend:/app
+      - ./ml:/app/ml
+      - ./datasets:/app/datasets
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis:    { condition: service_healthy }
+      qdrant:   { condition: service_started }
+    networks: [recnet]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/health/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ── Frontend (Next.js 15) ──────────────────────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: recengine-frontend
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      NEXT_PUBLIC_API_URL: http://backend:8000
+    depends_on: [backend]
+    networks: [recnet]
+
+  # ── Streamlit Analytics Dashboard ─────────────────────────────────────────
+  analytics:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.analytics
+    container_name: recengine-analytics
+    restart: unless-stopped
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./analytics:/app/analytics
+      - ./assets:/app/assets
+    networks: [recnet]
+
+  # ── PostgreSQL ─────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: recengine-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: recengine
+      POSTGRES_USER: recuser
+      POSTGRES_PASSWORD: recpass
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks: [recnet]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U recuser -d recengine"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── Redis ──────────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: recengine-redis
+    restart: unless-stopped
+    command: redis-server --maxmemory 512mb --maxmemory-policy allkeys-lru
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks: [recnet]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── Qdrant Vector Database ─────────────────────────────────────────────────
+  qdrant:
+    image: qdrant/qdrant:v1.11.0
+    container_name: recengine-qdrant
+    restart: unless-stopped
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - qdrant_data:/qdrant/storage
+    networks: [recnet]
+
+  # ── MLflow ────────────────────────────────────────────────────────────────
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:v2.17.0
+    container_name: recengine-mlflow
+    restart: unless-stopped
+    ports:
+      - "5000:5000"
+    command: mlflow server --host 0.0.0.0 --port 5000 --backend-store-uri postgresql://recuser:recpass@postgres:5432/mlflow_db --default-artifact-root /mlflow/artifacts
+    volumes:
+      - mlflow_data:/mlflow/artifacts
+    depends_on:
+      postgres: { condition: service_healthy }
+    networks: [recnet]
+
+  # ── Prometheus ────────────────────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:v2.54.0
+    container_name: recengine-prometheus
+    restart: unless-stopped
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./docker/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    networks: [recnet]
+
+  # ── Grafana ───────────────────────────────────────────────────────────────
+  grafana:
+    image: grafana/grafana:11.2.0
+    container_name: recengine-grafana
+    restart: unless-stopped
+    ports:
+      - "3001:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: recengine_admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - grafana_data:/var/lib/grafana
+    depends_on: [prometheus]
+    networks: [recnet]
